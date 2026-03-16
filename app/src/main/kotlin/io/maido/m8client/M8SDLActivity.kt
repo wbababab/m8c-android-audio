@@ -1,11 +1,13 @@
 package io.maido.m8client
 
+import android.Manifest
 import android.app.PendingIntent.FLAG_IMMUTABLE
 import android.app.PendingIntent.getBroadcast
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.pm.PackageManager
 import android.content.res.Configuration
 import android.graphics.Color
 import android.hardware.usb.UsbDevice
@@ -20,10 +22,13 @@ import android.util.Log
 import android.view.View
 import android.view.ViewGroup
 import android.widget.FrameLayout
+import androidx.core.app.ActivityCompat
+import androidx.core.content.ContextCompat
 import io.maido.m8client.M8Key.*
 import io.maido.m8client.M8Util.isM8
 import io.maido.m8client.settings.GeneralSettings
 import org.libsdl.app.SDLActivity
+import io.maido.m8client.audio.M8AudioBridge
 
 
 class M8SDLActivity : SDLActivity() {
@@ -31,6 +36,7 @@ class M8SDLActivity : SDLActivity() {
     companion object {
         private const val TAG = "M8SDLActivity"
         private const val ACTION_USB_PERMISSION = "io.maido.m8client.USB_PERMISSION"
+        private const val RECORD_AUDIO_PERMISSION_REQUEST = 1001
 
         fun startM8SDLActivity(context: Context) {
             val sdlActivity = Intent(context, M8SDLActivity::class.java)
@@ -57,6 +63,7 @@ class M8SDLActivity : SDLActivity() {
                 }
             } else if (ACTION_USB_DEVICE_DETACHED == action) {
                 Log.d(TAG, "Device was detached!")
+                audioBridge.stop()
             }
         }
     }
@@ -71,6 +78,7 @@ class M8SDLActivity : SDLActivity() {
     }
 
     private var usbConnection: UsbDeviceConnection? = null
+    private lateinit var audioBridge: M8AudioBridge
 
     override fun onStart() {
         Log.i(TAG, "Searching for an M8 device")
@@ -91,6 +99,7 @@ class M8SDLActivity : SDLActivity() {
 
     override fun onDestroy() {
         Log.d(TAG, "onDestroy()")
+        audioBridge.stop()
         super.onDestroy()
         unregisterReceiver(usbReceiver)
         usbConnection?.close()
@@ -104,6 +113,7 @@ class M8SDLActivity : SDLActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         Log.d(TAG, "onCreate()")
         super.onCreate(savedInstanceState)
+        audioBridge = M8AudioBridge(this)
         val generalPreferences = GeneralSettings.getGeneralPreferences(this)
         hintAudioDriver(generalPreferences.audioDriver)
         lockOrientation(
@@ -118,6 +128,52 @@ class M8SDLActivity : SDLActivity() {
         usbConnection = usbManager.openDevice(device)?.also {
             Log.d(TAG, "Setting file descriptor to ${it.fileDescriptor} ")
             connect(it.fileDescriptor)
+            startAudioBridge()
+        }
+    }
+
+    /**
+     * Start the native AudioRecord→AudioTrack audio bridge.
+     * This bypasses the broken libusb isochronous path and uses Android's
+     * kernel USB audio driver instead.
+     */
+    private fun startAudioBridge() {
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
+            != PackageManager.PERMISSION_GRANTED) {
+            Log.i(TAG, "Requesting RECORD_AUDIO permission for audio bridge")
+            ActivityCompat.requestPermissions(
+                this,
+                arrayOf(Manifest.permission.RECORD_AUDIO),
+                RECORD_AUDIO_PERMISSION_REQUEST
+            )
+            return
+        }
+        launchAudioBridge()
+    }
+
+    private fun launchAudioBridge() {
+        Log.d(TAG, audioBridge.getDiagnostics())
+        val success = audioBridge.start()
+        if (success) {
+            Log.i(TAG, "Audio bridge started successfully")
+        } else {
+            Log.e(TAG, "Audio bridge failed to start — check logcat for diagnostics")
+        }
+    }
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == RECORD_AUDIO_PERMISSION_REQUEST) {
+            if (grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+                Log.i(TAG, "RECORD_AUDIO permission granted, starting audio bridge")
+                launchAudioBridge()
+            } else {
+                Log.w(TAG, "RECORD_AUDIO permission denied — audio will not work")
+            }
         }
     }
 
