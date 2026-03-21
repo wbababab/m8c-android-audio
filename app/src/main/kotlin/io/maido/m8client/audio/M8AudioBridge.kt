@@ -5,6 +5,7 @@ import android.media.*
 import android.os.Build
 import android.util.Log
 import kotlinx.coroutines.*
+import android.media.MediaRecorder
 
 /**
  * M8AudioBridge — Replaces the broken libusb isochronous audio path with
@@ -48,6 +49,32 @@ class M8AudioBridge(private val context: Context) {
     @Volatile
     private var isRunning = false
 
+    // Cached before openDevice() detaches the kernel snd-usb-audio driver.
+    // After openDevice(), the M8's audio interface is no longer visible to AudioManager.
+    private var snapshotUsbInput: AudioDeviceInfo? = null
+
+    /**
+     * Capture the USB audio input device info NOW, before the USB device is opened.
+     * Must be called before connectToM8 / usbManager.openDevice().
+     */
+    fun snapshotUsbAudioDevice() {
+        // Log ALL input devices so we can diagnose which are visible
+        val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        val allInputs = audioManager.getDevices(AudioManager.GET_DEVICES_INPUTS)
+        Log.i(TAG, "All audio inputs BEFORE openDevice (${allInputs.size} devices):")
+        allInputs.forEach { d ->
+            Log.i(TAG, "  [${d.id}] ${d.productName} type=${d.type} " +
+                "rates=${d.sampleRates.joinToString()} ch=${d.channelCounts.joinToString()}")
+        }
+
+        snapshotUsbInput = findUsbAudioInputDevice()
+        if (snapshotUsbInput != null) {
+            Log.i(TAG, "Snapshotted USB audio input: ${snapshotUsbInput?.productName} (ID=${snapshotUsbInput?.id})")
+        } else {
+            Log.w(TAG, "No USB audio input found before openDevice — bridge will attempt with default input")
+        }
+    }
+
     /**
      * Find the USB audio input device (the M8/Teensy).
      * Returns the AudioDeviceInfo for the USB audio source, or null if not found.
@@ -60,6 +87,15 @@ class M8AudioBridge(private val context: Context) {
         return devices.firstOrNull { it.type == AudioDeviceInfo.TYPE_USB_DEVICE }
             ?: devices.firstOrNull { it.type == AudioDeviceInfo.TYPE_USB_HEADSET }
             ?: devices.firstOrNull { it.type == AudioDeviceInfo.TYPE_USB_ACCESSORY }
+    }
+
+    /**
+     * Find a specific output device by its AudioDeviceInfo ID.
+     */
+    private fun findDeviceById(deviceId: Int): AudioDeviceInfo? {
+        val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        return audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
+            .firstOrNull { it.id == deviceId }
     }
 
     /**
@@ -79,23 +115,46 @@ class M8AudioBridge(private val context: Context) {
     }
 
     /**
-     * Start the audio bridge. Returns true if successfully started.
+     * Start the audio bridge.
+     * @param outputDeviceId AudioDeviceInfo ID of the desired output device (0 = auto-detect).
+     * Returns true if successfully started.
      */
-    fun start(): Boolean {
+    fun start(outputDeviceId: Int = 0): Boolean {
         if (isRunning) {
             Log.w(TAG, "Audio bridge already running")
             return true
         }
 
-        val usbInput = findUsbAudioInputDevice()
+        // Log audio inputs AFTER openDevice() — shows if snd-usb-audio was detached
+        val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        val inputsAfterOpen = audioManager.getDevices(AudioManager.GET_DEVICES_INPUTS)
+        Log.i(TAG, "Audio inputs AFTER openDevice (${inputsAfterOpen.size} devices):")
+        inputsAfterOpen.forEach { d ->
+            Log.i(TAG, "  [${d.id}] ${d.productName} type=${d.type}")
+        }
+
+        // Use the snapshot captured before openDevice() detached snd-usb-audio.
+        // If no snapshot was taken (or it was null), fall back to a live query.
+        val usbInput = snapshotUsbInput ?: findUsbAudioInputDevice()
         if (usbInput == null) {
-            Log.e(TAG, "No USB audio input device found. Is the M8/Teensy connected?")
+            // No USB audio device found. Continuing without a preferred device would
+            // route AudioRecord to the built-in microphone and play mic audio through
+            // the speakers — clearly wrong. Abort and rely on the libusb ISO path.
+            Log.w(TAG, "No USB audio input found — aborting bridge (would capture built-in mic)")
             return false
         }
-        Log.i(TAG, "Found USB audio input: ${usbInput.productName} (ID: ${usbInput.id})")
+        Log.i(TAG, "Using USB audio input: ${usbInput.productName} (ID: ${usbInput.id})")
 
-        val outputDevice = findOutputDevice()
-        Log.i(TAG, "Output device: ${outputDevice?.productName ?: "system default"}")
+        // Use explicitly selected output device (from settings) if provided, else auto-detect.
+        val outputDevice = if (outputDeviceId > 0) {
+            findDeviceById(outputDeviceId).also { d ->
+                if (d != null) Log.i(TAG, "Using settings output device: ${d.productName} (ID: ${d.id})")
+                else Log.w(TAG, "Settings output device ID=$outputDeviceId not found, falling back to auto")
+            } ?: findOutputDevice()
+        } else {
+            findOutputDevice()
+        }
+        Log.i(TAG, "Output device: ${outputDevice?.productName ?: "system default"} (type=${outputDevice?.type})")
 
         // Calculate minimum buffer sizes
         val minRecordBufferSize = AudioRecord.getMinBufferSize(
@@ -116,70 +175,18 @@ class M8AudioBridge(private val context: Context) {
         val trackBufferSize = maxOf(minTrackBufferSize * 2, PREFERRED_BUFFER_SIZE * 4)
 
         try {
-            // Create AudioRecord targeting the USB input device
-            audioRecord = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                AudioRecord.Builder()
-                    .setAudioSource(MediaRecorder.AudioSource.UNPROCESSED) // Raw audio, no AGC/NS
-                    .setAudioFormat(
-                        AudioFormat.Builder()
-                            .setEncoding(AUDIO_FORMAT)
-                            .setSampleRate(SAMPLE_RATE)
-                            .setChannelMask(CHANNEL_CONFIG_IN)
-                            .build()
-                    )
-                    .setBufferSizeInBytes(recordBufferSize)
-                    .build().also { record ->
-                        // Route to the USB device explicitly
-                        record.setPreferredDevice(usbInput)
-                    }
-            } else {
-                @Suppress("DEPRECATION")
-                AudioRecord(
-                    MediaRecorder.AudioSource.DEFAULT,
-                    SAMPLE_RATE,
-                    CHANNEL_CONFIG_IN,
-                    AUDIO_FORMAT,
-                    recordBufferSize
-                )
-            }
+            // Try to create AudioRecord. We attempt multiple audio sources in order:
+            // 1. UNPROCESSED with preferred USB device (best quality, raw audio)
+            // 2. DEFAULT with preferred USB device (broader device support)
+            // 3. DEFAULT without preferred device (system default — may be phone mic, but
+            //    logs will show what source was actually used)
+            audioRecord = tryCreateAudioRecord(recordBufferSize, usbInput)
 
             if (audioRecord?.state != AudioRecord.STATE_INITIALIZED) {
-                Log.e(TAG, "AudioRecord failed to initialize. State: ${audioRecord?.state}")
-
-                // Fallback: try with DEFAULT source (some devices don't support UNPROCESSED)
-                Log.i(TAG, "Retrying with DEFAULT audio source...")
+                Log.e(TAG, "AudioRecord failed to initialize with all sources.")
                 audioRecord?.release()
-                audioRecord = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                    AudioRecord.Builder()
-                        .setAudioSource(MediaRecorder.AudioSource.DEFAULT)
-                        .setAudioFormat(
-                            AudioFormat.Builder()
-                                .setEncoding(AUDIO_FORMAT)
-                                .setSampleRate(SAMPLE_RATE)
-                                .setChannelMask(CHANNEL_CONFIG_IN)
-                                .build()
-                        )
-                        .setBufferSizeInBytes(recordBufferSize)
-                        .build().also { record ->
-                            record.setPreferredDevice(usbInput)
-                        }
-                } else {
-                    @Suppress("DEPRECATION")
-                    AudioRecord(
-                        MediaRecorder.AudioSource.DEFAULT,
-                        SAMPLE_RATE,
-                        CHANNEL_CONFIG_IN,
-                        AUDIO_FORMAT,
-                        recordBufferSize
-                    )
-                }
-
-                if (audioRecord?.state != AudioRecord.STATE_INITIALIZED) {
-                    Log.e(TAG, "AudioRecord still failed after fallback. Device may not support USB audio capture.")
-                    audioRecord?.release()
-                    audioRecord = null
-                    return false
-                }
+                audioRecord = null
+                return false
             }
 
             // Create AudioTrack for output
@@ -224,11 +231,37 @@ class M8AudioBridge(private val context: Context) {
                 return false
             }
 
-            // Start the bridge loop
-            isRunning = true
             audioRecord?.startRecording()
+
+            // Verify routing BEFORE committing — setPreferredDevice is a hint, not a guarantee.
+            // If Android ignored our preferred device and fell back to the built-in mic,
+            // abort immediately so we don't pipe the user's voice to their speakers.
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                val recordRouted = audioRecord?.routedDevice
+                Log.i(TAG, "AudioRecord routing → ${recordRouted?.productName ?: "unknown"} " +
+                    "(type=${recordRouted?.type}, id=${recordRouted?.id})")
+                if (recordRouted?.type == AudioDeviceInfo.TYPE_BUILTIN_MIC ||
+                    recordRouted?.type == AudioDeviceInfo.TYPE_BUILTIN_EARPIECE) {
+                    Log.e(TAG, "AudioRecord routed to built-in input — USB preferred device was ignored. Aborting bridge.")
+                    cleanup()
+                    return false
+                }
+            }
+
             audioTrack?.play()
 
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                val trackRouted = audioTrack?.routedDevice
+                Log.i(TAG, "AudioTrack routing  → ${trackRouted?.productName ?: "unknown"} " +
+                    "(type=${trackRouted?.type}, id=${trackRouted?.id})")
+                if (trackRouted?.type == AudioDeviceInfo.TYPE_USB_DEVICE ||
+                    trackRouted?.type == AudioDeviceInfo.TYPE_USB_HEADSET) {
+                    Log.w(TAG, "WARNING: AudioTrack is routing to USB device — this will feed audio BACK to M8!")
+                }
+            }
+
+            // Start the bridge loop
+            isRunning = true
             bridgeJob = scope.launch {
                 runBridgeLoop()
             }
@@ -250,6 +283,53 @@ class M8AudioBridge(private val context: Context) {
     }
 
     /**
+     * Try to create an AudioRecord, attempting multiple audio sources in order.
+     * Returns the first successfully initialized AudioRecord, or null if all fail.
+     */
+    private fun tryCreateAudioRecord(bufferSize: Int, usbInput: AudioDeviceInfo?): AudioRecord? {
+        val sources = listOf(
+            MediaRecorder.AudioSource.UNPROCESSED,
+            MediaRecorder.AudioSource.DEFAULT,
+            MediaRecorder.AudioSource.MIC
+        )
+        for (source in sources) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                val record = try {
+                    AudioRecord.Builder()
+                        .setAudioSource(source)
+                        .setAudioFormat(
+                            AudioFormat.Builder()
+                                .setEncoding(AUDIO_FORMAT)
+                                .setSampleRate(SAMPLE_RATE)
+                                .setChannelMask(CHANNEL_CONFIG_IN)
+                                .build()
+                        )
+                        .setBufferSizeInBytes(bufferSize)
+                        .build()
+                } catch (e: Exception) {
+                    Log.d(TAG, "AudioRecord source=$source build failed: ${e.message}")
+                    null
+                } ?: continue
+                if (usbInput != null) record.setPreferredDevice(usbInput)
+                if (record.state == AudioRecord.STATE_INITIALIZED) {
+                    Log.i(TAG, "AudioRecord initialized with source=$source, device=${usbInput?.productName ?: "default"}")
+                    return record
+                }
+                record.release()
+            } else {
+                @Suppress("DEPRECATION")
+                val record = AudioRecord(source, SAMPLE_RATE, CHANNEL_CONFIG_IN, AUDIO_FORMAT, bufferSize)
+                if (record.state == AudioRecord.STATE_INITIALIZED) {
+                    Log.i(TAG, "AudioRecord initialized (legacy) with source=$source")
+                    return record
+                }
+                record.release()
+            }
+        }
+        return null
+    }
+
+    /**
      * The core audio bridge loop — reads PCM from USB input and writes to speaker output.
      * Runs on a dedicated coroutine with IO dispatcher.
      */
@@ -262,10 +342,29 @@ class M8AudioBridge(private val context: Context) {
 
         Log.d(TAG, "Bridge loop started on thread: ${Thread.currentThread().name}")
 
+        // openDevice() is called on the main thread shortly after start() returns.
+        // If it detaches snd-usb-audio, AudioRecord silently falls back to the built-in
+        // microphone. Give the main thread time to finish opening the device, then verify
+        // we are still capturing from USB and not the phone's mic.
+        delay(800)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            val routed = audioRecord?.routedDevice
+            Log.i(TAG, "Post-connect routing check: ${routed?.productName ?: "unknown"} (type=${routed?.type})")
+            if (routed?.type == AudioDeviceInfo.TYPE_BUILTIN_MIC ||
+                routed?.type == AudioDeviceInfo.TYPE_BUILTIN_EARPIECE) {
+                Log.e(TAG, "AudioRecord fell back to built-in input after USB connect — stopping bridge.")
+                isRunning = false
+                cleanup()
+                return
+            }
+        }
+
         var underrunCount = 0L
         var totalFrames = 0L
+        var lastStatsMs = System.currentTimeMillis()
+        var framesSinceLastStats = 0L
 
-        while (isRunning && isActive) {
+        while (isRunning && currentCoroutineContext().isActive) {
             val record = audioRecord ?: break
             val track = audioTrack ?: break
 
@@ -286,6 +385,16 @@ class M8AudioBridge(private val context: Context) {
                             }
                         }
                         totalFrames += shortsRead
+                        framesSinceLastStats += shortsRead
+                        // Log audio throughput every 5 seconds
+                        val nowMs = System.currentTimeMillis()
+                        if (nowMs - lastStatsMs >= 5000) {
+                            val bytesPerSec = framesSinceLastStats * 2 * 1000 / (nowMs - lastStatsMs)
+                            Log.i(TAG, "Audio bridge: ${bytesPerSec} bytes/sec, " +
+                                "underruns=$underrunCount, totalFrames=$totalFrames")
+                            framesSinceLastStats = 0
+                            lastStatsMs = nowMs
+                        }
                     }
                     shortsRead == 0 -> {
                         // No data available, yield briefly
@@ -315,6 +424,9 @@ class M8AudioBridge(private val context: Context) {
         }
 
         Log.i(TAG, "Bridge loop ended. Total frames: $totalFrames, underruns: $underrunCount")
+        // If loop exited on its own (break or isRunning=false without stop() being called),
+        // ensure resources are released so the microphone indicator disappears.
+        cleanup()
     }
 
     /**

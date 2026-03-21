@@ -4,7 +4,7 @@
 [submodule "app/jni/SDL"]
 	path = app/jni/SDL
 	url = https://github.com/libsdl-org/SDL.git
-	branch = SDL2
+	branch = main
 [submodule "app/jni/m8c"]
 	path = app/jni/m8c
 	url = https://github.com/laamaa/m8c.git

@@ -1,7 +1,8 @@
-#include <SDL.h>
+#include "SDL3/SDL.h"
 #include <jni.h>
-#include "src/serial.h"
-#include "src/audio.h"
+#include "src/backends/m8.h"
+#include "src/backends/audio.h"
+#include "src/log_overlay.h"
 
 int device_active = 0;
 
@@ -17,7 +18,7 @@ Java_io_maido_m8client_M8TouchListener_00024Companion_sendClickEvent(JNIEnv *env
                                                                      jchar event) {
     if (device_active) {
         SDL_Log("Sending message to M8");
-        send_msg_controller(event);
+        m8_send_msg_controller((unsigned char)event);
     }
 }
 
@@ -35,7 +36,7 @@ Java_io_maido_m8client_M8SDLActivity_hintAudioDriver(JNIEnv *env, jobject thiz,
 JNIEXPORT void JNICALL
 Java_io_maido_m8client_M8TouchListener_00024Companion_resetScreen(JNIEnv *env, jobject thiz) {
     if (device_active) {
-        enable_and_reset_display();
+        m8_enable_display(1);
     }
 }
 
@@ -45,9 +46,26 @@ Java_io_maido_m8client_M8TouchListener_00024Companion_exit(JNIEnv *env, jobject 
     SDL_Log("Sending Alt+F4 to M8");
     SDL_Event sdlevent = {};
     sdlevent.type = SDL_KEYDOWN;
-    sdlevent.key.keysym.sym = SDLK_F4;
-    sdlevent.key.keysym.mod = KMOD_ALT;
+    sdlevent.key.key = SDLK_F4;
+    sdlevent.key.mod = KMOD_ALT;
     SDL_PushEvent(&sdlevent);
+}
+
+JNIEXPORT void JNICALL
+Java_io_maido_m8client_M8SDLActivity_toggleDebugOverlay(JNIEnv *env, jobject thiz) {
+    log_overlay_toggle();
+    SDL_Log("Debug overlay toggled: %s", log_overlay_is_visible() ? "ON" : "OFF");
+}
+
+JNIEXPORT void JNICALL
+Java_io_maido_m8client_M8SDLActivity_setDebugMode(JNIEnv *env, jobject thiz, jboolean enabled) {
+    if (enabled) {
+        SDL_SetLogPriorities(SDL_LOG_PRIORITY_DEBUG);
+        SDL_Log("Debug mode ON — verbose logging enabled");
+    } else {
+        SDL_SetLogPriorities(SDL_LOG_PRIORITY_INFO);
+        SDL_Log("Debug mode OFF");
+    }
 }
 
 JNIEXPORT void JNICALL

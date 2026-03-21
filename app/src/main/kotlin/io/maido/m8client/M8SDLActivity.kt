@@ -19,9 +19,13 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
+import android.view.Gravity
+import android.view.KeyEvent
 import android.view.View
 import android.view.ViewGroup
+import android.widget.Button
 import android.widget.FrameLayout
+import android.widget.Toast
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import io.maido.m8client.M8Key.*
@@ -42,7 +46,24 @@ class M8SDLActivity : SDLActivity() {
             val sdlActivity = Intent(context, M8SDLActivity::class.java)
             context.startActivity(sdlActivity)
         }
+    }
 
+    /**
+     * The NDK build names the SDL3 library "SDL2" (LOCAL_MODULE := SDL2 in SDL/Android.mk).
+     * We must load it as "SDL2", then our app libraries.
+     * SDL_main is defined in libm8c.so (main.c compiled there), so m8c must come before main.
+     * libusb-1.0 is auto-loaded as a transitive dependency.
+     */
+    override fun getLibraries(): Array<String> {
+        return arrayOf("SDL2", "m8c", "main")
+    }
+
+    /**
+     * SDL_main (the SDL_EnterAppMainCallbacks wrapper) is compiled into libm8c.so
+     * because main.c lives in the m8c NDK module.  Point nativeRunMain at that library.
+     */
+    override fun getMainSharedObject(): String {
+        return "${applicationInfo.nativeLibraryDir}/libm8c.so"
     }
 
     private val usbReceiver: BroadcastReceiver = object : BroadcastReceiver() {
@@ -114,6 +135,7 @@ class M8SDLActivity : SDLActivity() {
         Log.d(TAG, "onCreate()")
         super.onCreate(savedInstanceState)
         audioBridge = M8AudioBridge(this)
+
         val generalPreferences = GeneralSettings.getGeneralPreferences(this)
         hintAudioDriver(generalPreferences.audioDriver)
         lockOrientation(
@@ -121,14 +143,36 @@ class M8SDLActivity : SDLActivity() {
             else if (generalPreferences.lockOrientation) "LandscapeLeft LandscapeRight" else null
         )
         registerReceiver(usbReceiver, IntentFilter(ACTION_USB_DEVICE_DETACHED))
+
+        // Request RECORD_AUDIO early so permission is already granted when the M8
+        // connects. If we wait until connectToM8(), the permission dialog fires
+        // mid-connect, after openDevice() may have detached the snd-usb-audio
+        // kernel driver, making the USB audio device invisible to AudioRecord.
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
+            != PackageManager.PERMISSION_GRANTED) {
+            ActivityCompat.requestPermissions(
+                this,
+                arrayOf(Manifest.permission.RECORD_AUDIO),
+                RECORD_AUDIO_PERMISSION_REQUEST
+            )
+        }
     }
 
     private fun connectToM8(device: UsbDevice) {
+        // Snapshot USB audio device info BEFORE opening the USB device.
+        // openDevice() can detach the kernel snd-usb-audio driver on some devices,
+        // making the M8's audio interface invisible to AudioManager afterwards.
+        audioBridge.snapshotUsbAudioDevice()
+
+        // Start AudioRecord→AudioTrack bridge BEFORE openDevice(), so the recording
+        // stream is established while snd-usb-audio may still be bound to the audio
+        // interfaces. On devices without snd-usb-audio the bridge will self-abort.
+        startAudioBridge()
+
         val usbManager = getSystemService(UsbManager::class.java)!!
         usbConnection = usbManager.openDevice(device)?.also {
             Log.d(TAG, "Setting file descriptor to ${it.fileDescriptor} ")
             connect(it.fileDescriptor)
-            startAudioBridge()
         }
     }
 
@@ -153,7 +197,9 @@ class M8SDLActivity : SDLActivity() {
 
     private fun launchAudioBridge() {
         Log.d(TAG, audioBridge.getDiagnostics())
-        val success = audioBridge.start()
+        val prefs = GeneralSettings.getGeneralPreferences(this)
+        Log.i(TAG, "Starting audio bridge with output device ID=${prefs.audioDevice}")
+        val success = audioBridge.start(outputDeviceId = prefs.audioDevice)
         if (success) {
             Log.i(TAG, "Audio bridge started successfully")
         } else {
@@ -249,6 +295,23 @@ class M8SDLActivity : SDLActivity() {
         }
         val screen = mainLayout.findViewById<ViewGroup>(R.id.screen)
         screen.addView(view)
+
+        // Small overlay button to toggle the SDL debug log (always accessible).
+        val logBtn = Button(this).apply {
+            text = "LOG"
+            textSize = 9f
+            alpha = 0.55f
+            setOnClickListener {
+                toggleDebugOverlay()
+                Toast.makeText(this@M8SDLActivity, "Debug overlay toggled", Toast.LENGTH_SHORT).show()
+            }
+        }
+        mainLayout.addView(logBtn, FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.WRAP_CONTENT,
+            FrameLayout.LayoutParams.WRAP_CONTENT,
+            Gravity.TOP or Gravity.END
+        ).also { it.topMargin = 4; it.marginEnd = 4 })
+
         super.setContentView(mainLayout)
     }
 
@@ -278,10 +341,46 @@ class M8SDLActivity : SDLActivity() {
         buttons.findViewById<View>(viewId)?.setOnTouchListener(M8TouchListener(key))
     }
 
+    // SDL's dispatchKeyEvent consumes KEYCODE_BACK (returns true) so onBackPressed() is
+    // never reached. Intercept it here before SDL gets it.
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        if (event.keyCode == KeyEvent.KEYCODE_BACK) {
+            if (event.action == KeyEvent.ACTION_UP) {
+                startActivity(Intent(this, M8StartActivity::class.java))
+                finish()
+            }
+            return true
+        }
+        return super.dispatchKeyEvent(event)
+    }
+
+    // Debug: volume-up long press toggles the in-app SDL log overlay.
+    // This shows all SDL_Log output as an overlay on the M8 display.
+    private var volumeUpPressMs = 0L
+    override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
+        if (keyCode == KeyEvent.KEYCODE_VOLUME_UP) {
+            volumeUpPressMs = System.currentTimeMillis()
+        }
+        return super.onKeyDown(keyCode, event)
+    }
+    override fun onKeyUp(keyCode: Int, event: KeyEvent?): Boolean {
+        if (keyCode == KeyEvent.KEYCODE_VOLUME_UP) {
+            val held = System.currentTimeMillis() - volumeUpPressMs
+            if (held >= 1500) {
+                // Long press (≥1.5s) on volume-up toggles the debug log overlay
+                toggleDebugOverlay()
+                Toast.makeText(this, "Debug overlay toggled", Toast.LENGTH_SHORT).show()
+                return true
+            }
+        }
+        return super.onKeyUp(keyCode, event)
+    }
+
     private external fun connect(fileDescriptor: Int)
-
     private external fun hintAudioDriver(audioDriver: String?)
-
     private external fun lockOrientation(orientation: String?)
+    private external fun toggleDebugOverlay()
+    @Suppress("unused")
+    private external fun setDebugMode(enabled: Boolean)
 
 }
