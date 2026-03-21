@@ -83,8 +83,12 @@ class M8SDLActivity : SDLActivity() {
                     }
                 }
             } else if (ACTION_USB_DEVICE_DETACHED == action) {
-                Log.d(TAG, "Device was detached!")
-                audioBridge.stop()
+                val device = getExtraDevice(intent)
+                if (device != null && isM8(device)) {
+                    Log.i(TAG, "M8 detached, exiting")
+                    audioBridge.stop()
+                    M8TouchListener.exit()
+                }
             }
         }
     }
@@ -104,6 +108,10 @@ class M8SDLActivity : SDLActivity() {
     override fun onStart() {
         Log.i(TAG, "Searching for an M8 device")
         super.onStart()
+        if (usbConnection != null) {
+            Log.d(TAG, "Already connected to M8, skipping reconnect")
+            return
+        }
         val usbManager = getSystemService(UsbManager::class.java)
         for (device in usbManager.deviceList.values) {
             if (isM8(device)) {
